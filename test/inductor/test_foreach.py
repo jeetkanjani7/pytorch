@@ -49,6 +49,11 @@ def add_op(x, y):
     return torch.add(x, y)
 
 
+def add_inplace_op(x, y):
+    x.add_(y)
+    return x.sin()
+
+
 def addrecip_op(x, y):
     return torch.reciprocal(torch.add(x, y))
 
@@ -77,6 +82,7 @@ foreach_map_copy = foreach_map_wrapper(aten.copy)
 
 # More general functions
 foreach_map_add_fn = foreach_map_wrapper(add_op)
+foreach_map_add_inplace = foreach_map_wrapper(add_inplace_op)
 foreach_map_recipaddmul = foreach_map_wrapper(addrecip_op)
 foreach_map_addcmul = foreach_map_wrapper(addcmul_op)
 foreach_map_recipaddmul = foreach_map_wrapper(recipaddmul_op)
@@ -1028,6 +1034,40 @@ class ForeachTests(TestCase):
             torch.allclose(ref.grad, act.grad)
 
         self.assertEqual(torch._inductor.metrics.generated_kernel_count, 5)
+
+    def test_foreach_map_input_mutation(self):
+        def fn(xs, ys):
+            outs = foreach_map_add_inplace(xs, ys)
+            return outs[0].sum() + outs[1].sum() + outs[2].sum()
+
+        ref_inps = (
+            [
+                torch.rand(10, 20, device="cuda:0", requires_grad=True),
+                torch.rand(10, 30, device="cuda:0", requires_grad=True),
+                torch.rand(30, 30, device="cuda:0", requires_grad=True),
+            ],
+            [
+                torch.rand(10, 20, device="cuda:0", requires_grad=True),
+                torch.rand(10, 30, device="cuda:0", requires_grad=True),
+                torch.rand(30, 30, device="cuda:0", requires_grad=True),
+            ],
+        )
+        # Set requires_grad to be False to avoid mutating a leaf variable
+        inps = (
+            [x.clone().detach().requires_grad_(False) for x in ref_inps[0]],
+            [y.clone().detach().requires_grad_(False) for y in ref_inps[1]],
+        )
+
+        # TODO: "Buffer mutation detected during lowering of aten.add_.Tensor. "
+        # After decomposing auto_functionalized, we're getting
+        # a subgraph with potential input mutations. It's safe to
+        # mutate the input because we're guaranteed mutated inputs
+        # will gets copied if they're used downstream.
+        with self.assertRaisesRegex(
+            torch._inductor.exc.InductorError,
+            "Buffer mutation detected during lowering of aten.add_.Tensor",
+        ):
+            _ = run_fw_bw_and_get_code(lambda: torch.compile(fn)(*inps))
 
     @requires_cuda
     @foreach_map_un_ops
